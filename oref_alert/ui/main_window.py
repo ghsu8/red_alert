@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 import sys
 import csv
-from datetime import datetime
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, List
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
@@ -26,10 +27,12 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QLineEdit,
     QMessageBox,
-    QPlainTextEdit,
     QPushButton,
+    QHeaderView,
     QSpinBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -67,8 +70,9 @@ class SettingsWindow(QDialog):
         super().__init__()
         self.setWindowTitle("Red Alert - הגדרות")
         self.setWindowFlag(Qt.WindowStaysOnTopHint)
-        self.setMinimumSize(600, 500)
-        self.resize(600, 600)
+        self.setLayoutDirection(Qt.RightToLeft)
+        self.setMinimumSize(760, 620)
+        self.resize(860, 700)
 
         self._config = config
         self._on_save = on_save
@@ -76,12 +80,16 @@ class SettingsWindow(QDialog):
         self._on_exit = on_exit
 
         self._tabs = QTabWidget(self)
+        self._tabs.setLayoutDirection(Qt.RightToLeft)
         self._tabs.addTab(self._build_sound_tab(), "צלילים והתראות")
         self._tabs.addTab(self._build_filters_tab(), "סינון ומיקום")
         self._tabs.addTab(self._build_log_tab(), "יומן")
         self._tabs.addTab(self._build_misc_tab(), "כללי")
         self._tabs.addTab(self._build_about_tab(), "אודות")
         self._tabs.currentChanged.connect(self._on_tab_changed)
+
+        self._log_auto_refresh_timer = QTimer(self)
+        self._log_auto_refresh_timer.timeout.connect(self._on_log_auto_refresh_tick)
 
         # Track the latest alert cities for map display
         self._alert_cities_for_map: List[str] = []
@@ -136,8 +144,12 @@ class SettingsWindow(QDialog):
         self._config.google_maps_api_key = self._google_maps_api_key.text().strip()
         self._config.use_google_maps = self._use_google_maps_checkbox.isChecked()
         self._config.autostart = self._autostart_checkbox.isChecked()
+        self._config.debug_logging = self._debug_logging_checkbox.isChecked()
+        self._config.log_auto_refresh_enabled = self._log_auto_refresh_checkbox.isChecked()
+        self._config.log_auto_refresh_interval_seconds = self._log_refresh_interval_seconds_from_ui()
         self._config.popup_duration_seconds = None if self._popup_manual.isChecked() else self._popup_duration.value()
         self._config.save()
+        self._update_log_auto_refresh_timer()
 
     def _setup_keyboard_shortcuts(self) -> None:
         """Setup keyboard shortcuts like Alt+F4 for closing."""
@@ -348,14 +360,33 @@ class SettingsWindow(QDialog):
 
     def _build_log_tab(self) -> QWidget:
         container = QWidget()
+        container.setLayoutDirection(Qt.RightToLeft)
+        self._log_tab = container
         layout = QVBoxLayout(container)
+
+        def make_field_pair(label_text: str, field: QWidget, *, stretch: int = 0) -> QWidget:
+            pair = QWidget()
+            pair.setLayoutDirection(Qt.LeftToRight)
+            pair_layout = QHBoxLayout(pair)
+            pair_layout.setContentsMargins(0, 0, 0, 0)
+            pair_layout.setSpacing(6)
+            pair_layout.setDirection(QHBoxLayout.LeftToRight)
+            label = QLabel(label_text)
+            label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if stretch:
+                pair_layout.addWidget(field, stretch)
+            else:
+                pair_layout.addWidget(field)
+            pair_layout.addWidget(label)
+            return pair
 
         # Status label
         self._log_status = QLabel("סטטוס: מחכה לבדיקה...")
         layout.addWidget(self._log_status)
 
-        # Controls row: lines selector + search + filter
-        controls_layout = QHBoxLayout()
+        top_controls_layout = QHBoxLayout()
+        top_controls_layout.setDirection(QHBoxLayout.RightToLeft)
+        top_controls_layout.setAlignment(Qt.AlignRight)
 
         self._log_lines_spin = QSpinBox()
         self._log_lines_spin.setRange(10, 1000)
@@ -363,27 +394,70 @@ class SettingsWindow(QDialog):
         self._log_lines_spin.setSingleStep(10)
         self._log_lines_spin.valueChanged.connect(lambda: self._refresh_log())
 
-        controls_layout.addWidget(QLabel("הצג שורות אחרונות:"))
-        controls_layout.addWidget(self._log_lines_spin)
+        top_controls_layout.addWidget(make_field_pair("הצג שורות:", self._log_lines_spin))
+
+        self._log_prev_match_btn = QPushButton("◀")
+        self._log_prev_match_btn.setToolTip("התאמה קודמת")
+        self._log_prev_match_btn.clicked.connect(lambda: self._jump_to_highlight(-1))
+        self._log_prev_match_btn.setEnabled(False)
+        top_controls_layout.addWidget(self._log_prev_match_btn)
+
+        self._log_next_match_btn = QPushButton("▶")
+        self._log_next_match_btn.setToolTip("התאמה הבאה")
+        self._log_next_match_btn.clicked.connect(lambda: self._jump_to_highlight(1))
+        self._log_next_match_btn.setEnabled(False)
+        top_controls_layout.addWidget(self._log_next_match_btn)
+
+        self._log_match_counter = QLabel("0/0")
+        top_controls_layout.addWidget(self._log_match_counter)
+        top_controls_layout.addStretch(1)
+
+        layout.addLayout(top_controls_layout)
+
+        second_controls_layout = QHBoxLayout()
+        second_controls_layout.setDirection(QHBoxLayout.RightToLeft)
+        second_controls_layout.setAlignment(Qt.AlignRight)
+
+        self._log_time_filter = QComboBox()
+        self._log_time_filter.addItems(["הכל", "שעה אחרונה", "6 שעות", "24 שעות", "7 ימים"])
+        self._log_time_filter.currentTextChanged.connect(lambda _: self._refresh_log())
+        second_controls_layout.addWidget(make_field_pair("טווח זמן:", self._log_time_filter))
 
         self._log_filter = QComboBox()
         self._log_filter.addItems(["הכל", "ירי טילים", "כלי טיס עוין", "התראה מקדימה", "אירוע הסתיים", "no alert"])
         self._log_filter.currentTextChanged.connect(self._on_log_filter_changed)
-        controls_layout.addWidget(QLabel("סנן לפי סוג:"))
-        controls_layout.addWidget(self._log_filter)
+        second_controls_layout.addWidget(make_field_pair("סנן לפי סוג:", self._log_filter))
 
         self._log_search = QLineEdit()
-        self._log_search.setPlaceholderText("חיפוש בלוג (עיר, אזור, שגיאה)...")
+        self._log_search.setPlaceholderText("חיפוש לפי מלל...")
+        self._log_search.setAlignment(Qt.AlignRight)
         self._log_search.textChanged.connect(self._on_log_search_changed)
-        controls_layout.addWidget(self._log_search)
+        second_controls_layout.addWidget(make_field_pair("חיפוש:", self._log_search, stretch=1), 1)
 
-        layout.addLayout(controls_layout)
+        layout.addLayout(second_controls_layout)
 
-        # Log display
-        self._log_text = QPlainTextEdit()
-        self._log_text.setReadOnly(True)
-        self._log_text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        layout.addWidget(self._log_text)
+        self._log_table = QTableWidget(0, 4)
+        self._log_table.setLayoutDirection(Qt.RightToLeft)
+        self._log_table.setHorizontalHeaderLabels(["תאריך", "שעה", "סוג התראה", "אזורים"])
+        self._log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._log_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._log_table.setAlternatingRowColors(True)
+        self._log_table.verticalHeader().setVisible(False)
+        self._log_table.horizontalHeader().setStretchLastSection(True)
+        self._log_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._log_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self._log_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self._log_table.setStyleSheet(
+            "QTableWidget { background: #1f1f1f; alternate-background-color: #2b2b2b; gridline-color: #3a3a3a; color: white; }"
+            "QHeaderView::section { background: #2d2d2d; color: white; padding: 6px; border: 1px solid #3a3a3a; }"
+            "QTableWidget::item:selected { background: #0f766e; color: white; }"
+        )
+        layout.addWidget(self._log_table)
+
+        self._highlight_ranges: list[int] = []
+        self._highlight_index: int = -1
 
         # Buttons row
         btn_layout = QVBoxLayout()
@@ -393,7 +467,7 @@ class SettingsWindow(QDialog):
         btn_refresh.clicked.connect(lambda: self._refresh_log())
         buttons.addWidget(btn_refresh)
 
-        btn_export = QPushButton("ייצוא ל־CSV")
+        btn_export = QPushButton("EXPORT TO CSV")
         btn_export.clicked.connect(lambda: self._export_log_csv())
         buttons.addWidget(btn_export)
 
@@ -437,9 +511,170 @@ class SettingsWindow(QDialog):
         # Refresh log view when switching to the log tab.
         if self._tabs.tabText(index) == "יומן":
             self._refresh_log()
+        self._update_log_auto_refresh_timer()
+
+    def _log_refresh_interval_seconds_from_ui(self) -> int:
+        value = self._log_auto_refresh_value.value() if hasattr(self, "_log_auto_refresh_value") else 30
+        unit = self._log_auto_refresh_unit.currentText() if hasattr(self, "_log_auto_refresh_unit") else "שניות"
+        if unit == "דקות":
+            return max(1, value * 60)
+        return max(1, value)
+
+    def _sync_log_refresh_controls(self) -> None:
+        enabled = self._log_auto_refresh_checkbox.isChecked() if hasattr(self, "_log_auto_refresh_checkbox") else False
+        if hasattr(self, "_log_auto_refresh_value"):
+            self._log_auto_refresh_value.setEnabled(enabled)
+        if hasattr(self, "_log_auto_refresh_unit"):
+            self._log_auto_refresh_unit.setEnabled(enabled)
+
+    def _update_log_auto_refresh_timer(self) -> None:
+        if not hasattr(self, "_log_auto_refresh_checkbox"):
+            return
+
+        self._sync_log_refresh_controls()
+
+        is_log_tab = self._tabs.currentWidget() is getattr(self, "_log_tab", None)
+        if not self._log_auto_refresh_checkbox.isChecked() or not is_log_tab:
+            self._log_auto_refresh_timer.stop()
+            return
+
+        interval_ms = self._log_refresh_interval_seconds_from_ui() * 1000
+        self._log_auto_refresh_timer.start(interval_ms)
+
+    def _on_log_auto_refresh_tick(self) -> None:
+        if self._tabs.currentWidget() is getattr(self, "_log_tab", None):
+            self._refresh_log()
+
+    def _time_filter_delta(self) -> timedelta | None:
+        value = self._log_time_filter.currentText() if hasattr(self, "_log_time_filter") else "הכל"
+        if value == "שעה אחרונה":
+            return timedelta(hours=1)
+        if value == "6 שעות":
+            return timedelta(hours=6)
+        if value == "24 שעות":
+            return timedelta(hours=24)
+        if value == "7 ימים":
+            return timedelta(days=7)
+        return None
+
+    def _entry_in_time_window(self, entry: dict, window: timedelta | None) -> bool:
+        if window is None:
+            return True
+
+        ts = entry.get("timestamp")
+        if not ts:
+            return False
+
+        try:
+            dt = datetime.fromisoformat(ts)
+        except Exception:
+            return False
+        return dt >= datetime.now() - window
+
+    def _entry_matches_search(self, entry: dict, formatted: str, search_text: str) -> bool:
+        if not search_text:
+            return True
+
+        tokens = [t for t in search_text.lower().split() if t]
+        if not tokens:
+            return True
+
+        blob = " ".join(
+            [
+                formatted.lower(),
+                " ".join((entry.get("alert_cities") or [])).lower(),
+                " ".join((entry.get("matched_cities") or [])).lower(),
+                " ".join((entry.get("poi_matched_cities") or [])).lower(),
+                (entry.get("decision_reason") or "").lower(),
+                (entry.get("filter_mode") or "").lower(),
+                (entry.get("error") or "").lower(),
+                (entry.get("poi_city") or "").lower(),
+            ]
+        )
+
+        for token in tokens:
+            if ":" in token:
+                key, value = token.split(":", 1)
+                value = value.strip()
+                if not value:
+                    continue
+
+                if key == "city":
+                    haystack = [c.lower() for c in (entry.get("alert_cities") or [])]
+                    if not any(value in c for c in haystack):
+                        return False
+                elif key == "mode":
+                    if value not in (entry.get("filter_mode") or "").lower():
+                        return False
+                elif key == "reason":
+                    if value not in (entry.get("decision_reason") or "").lower():
+                        return False
+                elif key == "status":
+                    status = "displayed" if entry.get("displayed") else "filtered"
+                    if entry.get("fetch_success") is False:
+                        status = "error"
+                    if not entry.get("alert_present"):
+                        status = "noalert"
+                    if value != status:
+                        return False
+                elif key == "type":
+                    if value not in (entry.get("alert_type") or "").lower() and value not in formatted.lower():
+                        return False
+                else:
+                    if token not in blob:
+                        return False
+            else:
+                if token not in blob:
+                    return False
+
+        return True
+
+    def _highlight_search_matches(self, search_text: str) -> None:
+        """Track visible rows for next/previous navigation in the log table."""
+        if not search_text.strip():
+            self._highlight_ranges = []
+            self._highlight_index = -1
+            self._log_table.clearSelection()
+            self._update_highlight_nav_ui()
+            return
+
+        row_count = self._log_table.rowCount() if hasattr(self, "_log_table") else 0
+        self._highlight_ranges = list(range(row_count))
+        self._highlight_index = 0 if row_count else -1
+        self._update_highlight_nav_ui()
+        if row_count:
+            self._log_table.selectRow(self._highlight_index)
+
+    def _update_highlight_nav_ui(self) -> None:
+        total = len(getattr(self, "_highlight_ranges", []))
+        has_matches = total > 0
+
+        if hasattr(self, "_log_prev_match_btn"):
+            self._log_prev_match_btn.setEnabled(has_matches)
+        if hasattr(self, "_log_next_match_btn"):
+            self._log_next_match_btn.setEnabled(has_matches)
+
+        if hasattr(self, "_log_match_counter"):
+            if not has_matches:
+                self._log_match_counter.setText("0/0")
+            else:
+                self._log_match_counter.setText(f"{self._highlight_index + 1}/{total}")
+
+    def _jump_to_highlight(self, step: int) -> None:
+        if not self._highlight_ranges:
+            return
+
+        total = len(self._highlight_ranges)
+        self._highlight_index = (self._highlight_index + step) % total
+        row = self._highlight_ranges[self._highlight_index]
+        self._log_table.selectRow(row)
+        self._log_table.scrollToItem(self._log_table.item(row, 0), QAbstractItemView.PositionAtCenter)
+        self._update_highlight_nav_ui()
 
     def _refresh_log(self, search_text: str = "") -> None:
         logger = get_logger()
+        if not search_text:
+            search_text = self._log_search.text() if hasattr(self, "_log_search") else ""
         search_text = search_text.lower().strip()
 
         alert_type_names = {
@@ -452,6 +687,22 @@ class SettingsWindow(QDialog):
         }
 
         entries = logger.entries()
+        window = self._time_filter_delta()
+        entries = [e for e in entries if self._entry_in_time_window(e, window)]
+
+        # In normal mode, hide noisy connectivity/no-alert polling records.
+        debug_enabled = self._debug_logging_checkbox.isChecked() if hasattr(self, "_debug_logging_checkbox") else self._config.debug_logging
+        if not debug_enabled:
+            quiet_reasons = {"no_payload", "no_alert_in_payload", "invalid_json", "duplicate_alert_id"}
+            entries = [
+                e
+                for e in entries
+                if not (
+                    e.get("fetch_success") is True
+                    and not e.get("alert_present")
+                    and (e.get("decision_reason") in quiet_reasons or not e.get("decision_reason"))
+                )
+            ]
 
         # Ensure backward compatibility with old log entries that don't have alert_type field
         for entry in entries:
@@ -462,6 +713,10 @@ class SettingsWindow(QDialog):
                 else:
                     # Old entry without alert
                     entry["alert_type"] = None
+            if "decision_reason" not in entry:
+                entry["decision_reason"] = "legacy"
+            if "displayed" not in entry:
+                entry["displayed"] = bool(entry.get("alert_present") and entry.get("matched_cities"))
 
         # Apply type filter
         filter_type = self._log_filter.currentText()
@@ -486,7 +741,7 @@ class SettingsWindow(QDialog):
         else:
             self._log_status.setText("סטטוס: אין בדיקות עדיין (מחכה לבדיקה כל 5 שניות)")
 
-        lines = []
+        rows: list[tuple[str, str, str, str, str]] = []
         # Show newest entries first
         entries = list(reversed(entries))
 
@@ -497,33 +752,63 @@ class SettingsWindow(QDialog):
         for entry in entries:
             ts = entry.get("timestamp", "")
             formatted_ts = format_timestamp(ts)
+            try:
+                dt = datetime.fromisoformat(ts) if ts else None
+            except Exception:
+                dt = None
+            date_text = dt.strftime("%Y-%m-%d") if dt else formatted_ts.split(" ")[0] if formatted_ts else ""
+            time_text = dt.strftime("%H:%M:%S") if dt else (formatted_ts.split(" ")[1] if " " in formatted_ts else "")
             
             # Build the formatted line
             if entry.get("fetch_success") is False:
-                formatted = f"{formatted_ts}  ❌ fetch failed: {entry.get('error', '')}"
+                alert_type_text = "שגיאה"
+                areas_text = entry.get("error", "") or "-"
+                formatted = f"{formatted_ts}  ❌ fetch failed: {areas_text}"
             elif not entry.get("alert_present"):
-                formatted = f"{formatted_ts}  (no alert)"
+                reason = entry.get("decision_reason") or "no_alert"
+                alert_type_text = "ללא התראה"
+                areas_text = f"[{reason}]"
+                formatted = f"{formatted_ts}  (no alert) [{reason}]"
             else:
                 alert_type = entry.get("alert_type")
-                type_name = alert_type_names.get(alert_type, "לא ידוע")
+                alert_type_text = alert_type_names.get(alert_type, "לא ידוע")
 
                 matched = entry.get("matched_cities") or []
                 all_cities = entry.get("alert_cities") or []
                 matched_str = ", ".join(matched) if matched else "(ללא התאמה)"
+                areas_text = ", ".join(matched if matched else all_cities) or "-"
 
                 if all_cities and set(all_cities) != set(matched):
                     all_str = ", ".join(all_cities)
-                    formatted = f"{formatted_ts}  ✅ {type_name} - {matched_str} (כל הערים: {all_str})"
+                    formatted = f"{formatted_ts}  ✅ {alert_type_text} - {matched_str} (כל הערים: {all_str})"
                 else:
-                    formatted = f"{formatted_ts}  ✅ {type_name} - {matched_str}"
+                    formatted = f"{formatted_ts}  ✅ {alert_type_text} - {matched_str}"
+
+                if not entry.get("displayed"):
+                    reason = entry.get("decision_reason") or "filtered_out"
+                    alert_type_text = f"{alert_type_text} (סונן)"
+                    areas_text = matched_str
+                    formatted = f"{formatted_ts}  ⏭ סונן [{reason}] - {matched_str}"
 
             # Apply search filter
-            if search_text and search_text not in formatted.lower():
+            if not self._entry_matches_search(entry, formatted, search_text):
                 continue
 
-            lines.append(formatted)
+            rows.append((date_text, time_text, alert_type_text, areas_text, formatted))
 
-        self._log_text.setPlainText("\n".join(lines))
+        self._log_table.setRowCount(len(rows))
+        for row_index, (date_text, time_text, alert_type_text, areas_text, formatted) in enumerate(rows):
+            items = [
+                QTableWidgetItem(date_text),
+                QTableWidgetItem(time_text),
+                QTableWidgetItem(alert_type_text),
+                QTableWidgetItem(areas_text),
+            ]
+            for col, item in enumerate(items):
+                item.setToolTip(formatted)
+                self._log_table.setItem(row_index, col, item)
+
+        self._highlight_search_matches(search_text)
 
     def _export_log_csv(self) -> None:
         """Export the current log to a CSV file."""
@@ -532,8 +817,7 @@ class SettingsWindow(QDialog):
 
         logger = get_logger()
         if not logger.entries():
-            # Show a simple message
-            self._log_text.setPlainText("(הלוג ריק - אין מה לייצא)")
+            QMessageBox.information(self, "ייצוא לוג", "הלוג ריק - אין מה לייצא.")
             return
 
         path = QFileDialog.getSaveFileName(
@@ -545,7 +829,19 @@ class SettingsWindow(QDialog):
         try:
             with open(path[0], "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow(["Timestamp", "Status", "Alert Present", "Matched Cities", "Regions", "Cities"])
+                writer.writerow([
+                    "Timestamp",
+                    "Status",
+                    "Alert Present",
+                    "Matched Cities",
+                    "POI Matched Cities",
+                    "Decision Reason",
+                    "Filter Mode",
+                    "POI",
+                    "Regions",
+                    "Cities",
+                    "Distance Details",
+                ])
 
                 for entry in logger.entries():
                     ts = entry.get("timestamp", "")
@@ -553,15 +849,31 @@ class SettingsWindow(QDialog):
                     success = "✅" if entry.get("fetch_success") else "❌"
                     alert_present = "כן" if entry.get("alert_present") else "לא"
                     matched = ", ".join(entry.get("matched_cities", []))
+                    poi_matched = ", ".join(entry.get("poi_matched_cities", []))
+                    reason = entry.get("decision_reason", "")
+                    mode = entry.get("filter_mode", "")
+                    poi = entry.get("poi_city", "")
                     regions = ", ".join(entry.get("selected_regions", []))
                     cities = ", ".join(entry.get("selected_cities", []))
+                    distance_details = json.dumps(entry.get("distance_details", []), ensure_ascii=False)
 
-                    writer.writerow([formatted_ts, success, alert_present, matched, regions, cities])
+                    writer.writerow([
+                        formatted_ts,
+                        success,
+                        alert_present,
+                        matched,
+                        poi_matched,
+                        reason,
+                        mode,
+                        poi,
+                        regions,
+                        cities,
+                        distance_details,
+                    ])
 
-            # Show confirmation
-            self._log_text.setPlainText(f"(ייצוא הצליח: {path[0]})")
+            QMessageBox.information(self, "ייצוא לוג", f"ייצוא הצליח:\n{path[0]}")
         except Exception as e:
-            self._log_text.setPlainText(f"(שגיאה בייצוא: {str(e)})")
+            QMessageBox.critical(self, "שגיאת ייצוא", f"שגיאה בייצוא:\n{str(e)}")
 
     def _clear_log(self) -> None:
         """Clear the log file."""
@@ -574,10 +886,53 @@ class SettingsWindow(QDialog):
             logger = get_logger()
             logger._entries.clear()
 
-            self._log_text.setPlainText("(הלוג נוקה בהצלחה - בדיקות חדשות יתחילו להישמר תוך 5 שניות)")
             self._log_status.setText("סטטוס: הלוג נוקה")
+            self._refresh_log()
+            QMessageBox.information(self, "ניקוי לוג", "הלוג נוקה בהצלחה.")
         except Exception as e:
-            self._log_text.setPlainText(f"(שגיאה בניקוי לוג: {str(e)})")
+            QMessageBox.critical(self, "שגיאת ניקוי", f"שגיאה בניקוי לוג:\n{str(e)}")
+
+    def _show_last_no_alert_reason(self) -> None:
+        """Show an explanation for the most recent alert that was filtered out."""
+        entries = list(reversed(get_logger().entries()))
+        target = None
+        for entry in entries:
+            if entry.get("fetch_success") is False:
+                continue
+            if entry.get("alert_present") and not entry.get("displayed", bool(entry.get("matched_cities"))):
+                target = entry
+                break
+
+        if not target:
+            QMessageBox.information(self, "אין מקרה רלוונטי", "לא נמצאה התראה שסוננה לאחרונה.")
+            return
+
+        reason = target.get("decision_reason", "לא ידוע")
+        mode = target.get("filter_mode", "")
+        alert_cities = ", ".join(target.get("alert_cities", [])) or "(ללא ערים)"
+        matched = ", ".join(target.get("matched_cities", [])) or "(ללא התאמה)"
+        poi_matched = ", ".join(target.get("poi_matched_cities", [])) or "(ללא התאמת POI)"
+
+        details_lines = []
+        for item in target.get("distance_details", [])[:8]:
+            city = item.get("city", "")
+            dist = item.get("distance_km")
+            src = item.get("coords_source", "")
+            if dist is None:
+                details_lines.append(f"- {city}: ללא קואורדינטות ({src})")
+            else:
+                details_lines.append(f"- {city}: {dist} ק\"מ ({src})")
+
+        details_text = "\n".join(details_lines) if details_lines else "- אין פרטי מרחק"
+        message = (
+            f"סיבת החלטה: {reason}\n"
+            f"מצב סינון: {mode}\n"
+            f"ערים בהתראה: {alert_cities}\n"
+            f"ערים שעברו סינון: {matched}\n"
+            f"ערים בטווח POI: {poi_matched}\n\n"
+            f"פרטי מרחק:\n{details_text}"
+        )
+        QMessageBox.information(self, "למה לא קיבלתי התראה", message)
 
     def _build_misc_tab(self) -> QWidget:
         container = QWidget()
@@ -604,13 +959,42 @@ class SettingsWindow(QDialog):
         self._test_alert_button.clicked.connect(self._on_test_alert_clicked)
         layout.addWidget(self._test_alert_button)
 
+        self._debug_logging_checkbox = QCheckBox("מצב דיבוג לוג (שמור גם no alert / no_payload)")
+        self._debug_logging_checkbox.stateChanged.connect(lambda _: self._refresh_log())
+        layout.addWidget(self._debug_logging_checkbox)
+
+        self._log_auto_refresh_checkbox = QCheckBox("רענון אוטומטי ליומן")
+        self._log_auto_refresh_checkbox.stateChanged.connect(lambda _: self._update_log_auto_refresh_timer())
+        layout.addWidget(self._log_auto_refresh_checkbox)
+
+        auto_refresh_row = QWidget()
+        auto_refresh_layout = QHBoxLayout(auto_refresh_row)
+        auto_refresh_layout.setContentsMargins(0, 0, 0, 0)
+        auto_refresh_layout.addWidget(QLabel("כל"))
+
+        self._log_auto_refresh_value = QSpinBox()
+        self._log_auto_refresh_value.setRange(1, 3600)
+        self._log_auto_refresh_value.setValue(30)
+        self._log_auto_refresh_value.valueChanged.connect(lambda _: self._update_log_auto_refresh_timer())
+        auto_refresh_layout.addWidget(self._log_auto_refresh_value)
+
+        self._log_auto_refresh_unit = QComboBox()
+        self._log_auto_refresh_unit.addItems(["שניות", "דקות"])
+        self._log_auto_refresh_unit.currentTextChanged.connect(lambda _: self._update_log_auto_refresh_timer())
+        auto_refresh_layout.addWidget(self._log_auto_refresh_unit)
+        auto_refresh_layout.addStretch(1)
+        layout.addWidget(auto_refresh_row)
+
         layout.addStretch(1)
         container.setLayout(layout)
         return container
 
     def _browse_sound(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "בחר קובץ צליל", os.path.expanduser("~"), "Wave Files (*.wav);;All Files (*)"
+            self,
+            "בחר קובץ צליל",
+            os.path.expanduser("~"),
+            "Audio Files (*.wav *.mp3);;Wave Files (*.wav);;MP3 Files (*.mp3);;All Files (*)",
         )
         if path:
             self._custom_sound_path.setText(path)
@@ -649,6 +1033,17 @@ class SettingsWindow(QDialog):
         self._use_google_maps_checkbox.setChecked(self._config.use_google_maps)
         self._google_maps_api_key.setText(self._config.google_maps_api_key)
         self._google_maps_api_key.setEnabled(self._config.use_google_maps)
+        self._debug_logging_checkbox.setChecked(self._config.debug_logging)
+
+        interval = int(self._config.log_auto_refresh_interval_seconds or 30)
+        if interval % 60 == 0 and interval >= 60:
+            self._log_auto_refresh_unit.setCurrentText("דקות")
+            self._log_auto_refresh_value.setValue(max(1, interval // 60))
+        else:
+            self._log_auto_refresh_unit.setCurrentText("שניות")
+            self._log_auto_refresh_value.setValue(max(1, interval))
+        self._log_auto_refresh_checkbox.setChecked(self._config.log_auto_refresh_enabled)
+        self._update_log_auto_refresh_timer()
 
         # Refresh map preview with saved POI
         self._update_map_preview()
@@ -691,32 +1086,40 @@ class SettingsWindow(QDialog):
         self._update_map_preview()
 
     def _on_save_clicked(self) -> None:
-        self._config.sound_mode = self._sound_mode.currentText()
-        self._config.custom_sound_path = self._custom_sound_path.text() or ""
-        self._config.alert_mode = self._alert_mode.currentText()
+        try:
+            self._config.sound_mode = self._sound_mode.currentText()
+            self._config.custom_sound_path = self._custom_sound_path.text() or ""
+            self._config.alert_mode = self._alert_mode.currentText()
 
-        self._config.selected_regions = self._selected_regions() or ["כל האזורים"]
-        self._config.selected_cities = self._selected_cities()
-        self._config.selected_region = self._config.selected_regions[0]
-        self._config.selected_city = self._config.selected_cities[0] if self._config.selected_cities else ""
+            self._config.selected_regions = self._selected_regions() or ["כל האזורים"]
+            self._config.selected_cities = self._selected_cities()
+            self._config.selected_region = self._config.selected_regions[0]
+            self._config.selected_city = self._config.selected_cities[0] if self._config.selected_cities else ""
 
-        self._config.poi_city = self._poi_city.currentText()
-        self._config.poi_distance_km = float(self._poi_distance.value())
-        self._config.google_maps_api_key = self._google_maps_api_key.text().strip()
-        self._config.use_google_maps = self._use_google_maps_checkbox.isChecked()
-        self._config.selected_regions = self._selected_regions() or ["כל האזורים"]
-        self._config.selected_cities = self._selected_cities()
-        self._config.autostart = self._autostart_checkbox.isChecked()
-        self._config.popup_duration_seconds = None if self._popup_manual.isChecked() else self._popup_duration.value()
-        self._config.save()
+            self._config.poi_city = self._poi_city.currentText()
+            self._config.poi_distance_km = float(self._poi_distance.value())
+            self._config.google_maps_api_key = self._google_maps_api_key.text().strip()
+            self._config.use_google_maps = self._use_google_maps_checkbox.isChecked()
+            self._config.selected_regions = self._selected_regions() or ["כל האזורים"]
+            self._config.selected_cities = self._selected_cities()
+            self._config.autostart = self._autostart_checkbox.isChecked()
+            self._config.debug_logging = self._debug_logging_checkbox.isChecked()
+            self._config.log_auto_refresh_enabled = self._log_auto_refresh_checkbox.isChecked()
+            self._config.log_auto_refresh_interval_seconds = self._log_refresh_interval_seconds_from_ui()
+            self._config.popup_duration_seconds = None if self._popup_manual.isChecked() else self._popup_duration.value()
+            self._config.save()
+            self._update_log_auto_refresh_timer()
 
-        if self._on_save:
-            self._on_save()
+            if self._on_save:
+                self._on_save()
 
-        # Minimize to system tray after saving
-        self.hide()
+            QMessageBox.information(self, "שמירה", "ההגדרות נשמרו בהצלחה.")
+        except Exception as exc:
+            QMessageBox.critical(self, "שגיאת שמירה", f"שמירת ההגדרות נכשלה:\n{exc}")
 
     def _on_test_alert_clicked(self) -> None:
+        # Apply current UI state first so simulation reflects unsaved settings.
+        self._save_current_state_to_config()
         if self._on_test_alert:
             self._on_test_alert()
 

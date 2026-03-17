@@ -8,6 +8,7 @@ from typing import List, Optional
 from PySide6.QtWidgets import QApplication
 
 from oref_alert.config import AppConfig, set_autostart
+from oref_alert.data import city_regions
 from oref_alert.log import get_logger
 from oref_alert.notifier import AlertFetcher
 from oref_alert.sound import play_alert_sound
@@ -46,6 +47,7 @@ class RedAlertApp:
     def run(self) -> None:
         self._setup_tray()
         self._apply_autostart()
+        self._open_settings()
 
         # Show a brief startup notification so the user can confirm the app is running.
         show_notification(
@@ -121,14 +123,36 @@ class RedAlertApp:
 
     def _run_test_alert(self) -> None:
         """Simulate an alert so the user can see the UI / sound without real data."""
-        # Build a safe fixed test payload
+        mode = self.config.alert_mode
+        simulated_cities: List[str]
+
+        if mode == "מותאם אישית":
+            if self.config.selected_cities:
+                simulated_cities = self.config.selected_cities[:5]
+            elif self.config.selected_regions and "כל האזורים" not in self.config.selected_regions:
+                matched = [
+                    city
+                    for city, region in city_regions.items()
+                    if region in self.config.selected_regions
+                ]
+                simulated_cities = matched[:5] if matched else [self.config.poi_city or "תל אביב"]
+            else:
+                simulated_cities = [self.config.poi_city or "תל אביב"]
+        elif mode == "נקודת ייחוס":
+            simulated_cities = [self.config.poi_city or "תל אביב"]
+        else:
+            simulated_cities = [self.config.poi_city or "תל אביב", "ירושלים", "חיפה"]
+
+        duration_ms = 0 if self.config.popup_duration_seconds is None else self.config.popup_duration_seconds * 1000
+
+        # Build simulation payload based on current settings
         summary = type(
             "_",
             (),
             {
                 "title": "סימולציית התראה",
-                "cities": [self.config.poi_city or "תל אביב"],
-                "details": "זו התראה לדוגמה כדי לבדוק את התצוגה והצליל.",
+                "cities": simulated_cities,
+                "details": f"זו התראה לדוגמה לפי מצב: {mode}",
                 "color": "#3B82F6",
             },
         )()
@@ -139,6 +163,7 @@ class RedAlertApp:
             cities=summary.cities,
             details=summary.details,
             color=summary.color,
+            duration_ms=duration_ms,
         )
 
     def _open_log(self) -> None:

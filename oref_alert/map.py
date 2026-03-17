@@ -102,6 +102,12 @@ def resolve_location_coordinates(name: str, api_key: str = "") -> Optional[Tuple
             return float(cached[0]), float(cached[1])
 
     if not api_key:
+        for candidate in candidates:
+            coords = _geocode_with_nominatim(candidate)
+            if coords is not None:
+                cache[candidate] = [coords[0], coords[1]]
+                _save_geocode_cache(cache)
+                return coords
         return None
 
     for candidate in candidates:
@@ -139,6 +145,41 @@ def _geocode_with_google(name: str, api_key: str) -> Optional[Tuple[float, float
     if lat is None or lng is None:
         return None
     return float(lat), float(lng)
+
+
+def _geocode_with_nominatim(name: str) -> Optional[Tuple[float, float]]:
+    """Fallback geocoding via OpenStreetMap Nominatim (no API key required)."""
+    params = {
+        "q": name,
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": "il",
+        "accept-language": "he",
+    }
+    headers = {
+        "User-Agent": "RedAlertDesktop/1.0 (local desktop app)",
+    }
+
+    try:
+        resp = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        results = resp.json()
+    except Exception:
+        return None
+
+    if not isinstance(results, list) or not results:
+        return None
+
+    first = results[0] if isinstance(results[0], dict) else {}
+    lat = first.get("lat")
+    lon = first.get("lon")
+    if lat is None or lon is None:
+        return None
+
+    try:
+        return float(lat), float(lon)
+    except Exception:
+        return None
 
 
 def known_locations_with_coordinates(names: Iterable[str], api_key: str = "") -> list[tuple[str, tuple[float, float]]]:

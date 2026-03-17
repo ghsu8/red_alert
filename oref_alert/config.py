@@ -54,6 +54,9 @@ class ConfigPayload(TypedDict, total=False):
     autostart: bool
     last_seen_alert_id: str
     popup_duration_seconds: Optional[int]
+    debug_logging: bool
+    log_auto_refresh_enabled: bool
+    log_auto_refresh_interval_seconds: int
 
 
 DEFAULT_CONFIG: ConfigPayload = {
@@ -71,6 +74,9 @@ DEFAULT_CONFIG: ConfigPayload = {
     "autostart": False,
     "last_seen_alert_id": "",
     "popup_duration_seconds": 10,
+    "debug_logging": False,
+    "log_auto_refresh_enabled": False,
+    "log_auto_refresh_interval_seconds": 30,
 }
 
 
@@ -97,6 +103,11 @@ class AppConfig:
 
     # Popup behavior
     popup_duration_seconds: Optional[int] = DEFAULT_CONFIG["popup_duration_seconds"]
+
+    # Logging/debug behavior
+    debug_logging: bool = DEFAULT_CONFIG["debug_logging"]
+    log_auto_refresh_enabled: bool = DEFAULT_CONFIG["log_auto_refresh_enabled"]
+    log_auto_refresh_interval_seconds: int = DEFAULT_CONFIG["log_auto_refresh_interval_seconds"]
 
     # Internal state
     last_seen_alert_id: str = DEFAULT_CONFIG["last_seen_alert_id"]
@@ -143,6 +154,15 @@ class AppConfig:
             )
             self.use_google_maps = bool(payload.get("use_google_maps", self.use_google_maps))
             self.autostart = bool(payload.get("autostart", self.autostart))
+            popup_duration = payload.get("popup_duration_seconds", self.popup_duration_seconds)
+            self.popup_duration_seconds = None if popup_duration is None else int(popup_duration)
+            self.debug_logging = bool(payload.get("debug_logging", self.debug_logging))
+            self.log_auto_refresh_enabled = bool(
+                payload.get("log_auto_refresh_enabled", self.log_auto_refresh_enabled)
+            )
+            self.log_auto_refresh_interval_seconds = int(
+                payload.get("log_auto_refresh_interval_seconds", self.log_auto_refresh_interval_seconds)
+            )
             self.last_seen_alert_id = str(payload.get("last_seen_alert_id", self.last_seen_alert_id))
 
     def save(self) -> None:
@@ -160,6 +180,10 @@ class AppConfig:
             "google_maps_api_key": self.google_maps_api_key,
             "use_google_maps": self.use_google_maps,
             "autostart": self.autostart,
+            "popup_duration_seconds": self.popup_duration_seconds,
+            "debug_logging": self.debug_logging,
+            "log_auto_refresh_enabled": self.log_auto_refresh_enabled,
+            "log_auto_refresh_interval_seconds": self.log_auto_refresh_interval_seconds,
             "last_seen_alert_id": self.last_seen_alert_id,
         }
 

@@ -16,6 +16,7 @@ from oref_alert.config import AppConfig
 from difflib import get_close_matches
 
 from oref_alert.data import city_coordinates, city_regions
+from oref_alert.map import resolve_location_coordinates
 from oref_alert.models import AlertEvent, AlertSummary, AlertType, PointOfInterest
 from oref_alert.utils import compute_distance_km, bearing_between
 
@@ -57,10 +58,18 @@ class AlertFetcher(QObject):
         last_seen: Optional[str] = self._config.last_seen_alert_id
         while not self._stop_event.is_set():
             try:
-                status, alert, matched_cities = self._fetch_once(last_seen)
+                status, alert, matched_cities, meta = self._fetch_once(last_seen)
+                should_emit = status == FetchStatus.OK and alert is not None and bool(matched_cities)
+                reason = meta.get("reason", "unknown")
+                noisy_no_alert_reasons = {"no_payload", "no_alert_in_payload", "invalid_json", "duplicate_alert_id"}
+                should_log_attempt = True
+                if not self._config.debug_logging:
+                    should_log_attempt = not (
+                        status == FetchStatus.OK and alert is None and reason in noisy_no_alert_reasons
+                    )
 
                 # Log the attempt.
-                if self._logger is not None:
+                if self._logger is not None and should_log_attempt:
                     self._logger.append(
                         {
                             "timestamp": datetime.now().isoformat(),
@@ -73,12 +82,16 @@ class AlertFetcher(QObject):
                             "selected_cities": self._config.selected_cities,
                             "poi_city": self._config.poi_city,
                             "poi_distance_km": self._config.poi_distance_km,
-                            "alert_cities": alert.cities if alert else [],
+                            "alert_cities": meta.get("raw_alert_cities", alert.cities if alert else []),
                             "matched_cities": matched_cities,
+                            "poi_matched_cities": meta.get("poi_matched_cities", []),
+                            "decision_reason": reason,
+                            "displayed": should_emit,
+                            "distance_details": meta.get("distance_details", []),
                         }
                     )
 
-                if status == FetchStatus.OK and alert and matched_cities:
+                if should_emit:
                     last_seen = alert.id
                     self._config.last_seen_alert_id = last_seen
                     self._config.save()
@@ -98,12 +111,17 @@ class AlertFetcher(QObject):
                             "selected_cities": self._config.selected_cities,
                             "poi_city": self._config.poi_city,
                             "poi_distance_km": self._config.poi_distance_km,
+                            "decision_reason": "fetch_exception",
+                            "displayed": False,
+                            "distance_details": [],
                         }
                     )
 
             self._stop_event.wait(self._interval)
 
-    def _fetch_once(self, last_seen_id: Optional[str]) -> Tuple[FetchStatus, Optional[AlertSummary], List[str]]:
+    def _fetch_once(
+        self, last_seen_id: Optional[str]
+    ) -> Tuple[FetchStatus, Optional[AlertSummary], List[str], Dict[str, Any]]:
         headers = {
             "User-Agent": "RedAlertDesktop/1.0",
             "Referer": "https://www.oref.org.il/",
@@ -117,27 +135,39 @@ class AlertFetcher(QObject):
                 print(f"[DEBUG] Fetched payload length: {len(payload)}")
                 if not payload:
                     print(f"[DEBUG] Empty payload, returning no alert")
-                    return FetchStatus.OK, None, []
+                    return FetchStatus.OK, None, [], {"reason": "no_payload", "raw_alert_cities": []}
 
                 try:
                     data = json.loads(payload)
                 except json.JSONDecodeError:
                     print(f"[DEBUG] Invalid JSON payload, returning no alert")
-                    return FetchStatus.OK, None, []
+                    return FetchStatus.OK, None, [], {"reason": "invalid_json", "raw_alert_cities": []}
 
                 print(f"[DEBUG] Parsed JSON, data keys: {data.keys()}")
                 alert = self._parse_payload(data)
                 print(f"[DEBUG] Parsed alert: {alert.title if alert else 'None'}, cities: {alert.cities if alert else []}")
                 if not alert:
                     print(f"[DEBUG] Parse returned no alert")
-                    return FetchStatus.OK, None, []
+                    return FetchStatus.OK, None, [], {"reason": "no_alert_in_payload", "raw_alert_cities": []}
+
+                raw_alert_cities = list(alert.cities)
 
                 if last_seen_id and alert.id == last_seen_id:
                     print(f"[DEBUG] Alert ID already seen, skipping")
-                    return FetchStatus.OK, None, []
+                    return (
+                        FetchStatus.OK,
+                        None,
+                        [],
+                        {
+                            "reason": "duplicate_alert_id",
+                            "raw_alert_cities": raw_alert_cities,
+                            "distance_details": self._distance_details(raw_alert_cities),
+                        },
+                    )
 
                 matched = self._matched_cities(alert.cities)
                 poi_matched = self._cities_within_poi_distance(alert.cities)
+                distance_details = self._distance_details(raw_alert_cities)
                 print(f"[DEBUG] Matched cities: {matched} (filter mode={self._config.alert_mode})")
                 print(f"[DEBUG] POI matched cities ({self._config.poi_city} @ {self._config.poi_distance_km}km): {poi_matched}")
 
@@ -157,15 +187,83 @@ class AlertFetcher(QObject):
                     )
 
                 if not matched and not notify_due_to_poi:
-                    return FetchStatus.OK, None, []
+                    return (
+                        FetchStatus.OK,
+                        None,
+                        [],
+                        {
+                            "reason": "filtered_out",
+                            "raw_alert_cities": raw_alert_cities,
+                            "poi_matched_cities": poi_matched,
+                            "distance_details": distance_details,
+                        },
+                    )
 
-                return FetchStatus.OK, alert, matched or poi_matched
+                reason = "matched_filter"
+                if notify_due_to_poi and not matched:
+                    reason = "matched_by_poi"
+
+                return (
+                    FetchStatus.OK,
+                    alert,
+                    matched or poi_matched,
+                    {
+                        "reason": reason,
+                        "raw_alert_cities": raw_alert_cities,
+                        "poi_matched_cities": poi_matched,
+                        "distance_details": distance_details,
+                    },
+                )
             except Exception as exc:
                 print(f"[DEBUG] Exception on attempt {attempt}: {exc}")
                 if attempt == 2:
                     raise
                 time.sleep(1)
-        return FetchStatus.ERROR, None, []
+        return FetchStatus.ERROR, None, [], {"reason": "fetch_error", "raw_alert_cities": []}
+
+    def _distance_details(self, cities: List[str]) -> List[Dict[str, Any]]:
+        """Return per-city distance debug info for richer logs."""
+        details: List[Dict[str, Any]] = []
+
+        poi_city = self._config.poi_city
+        poi_radius = float(self._config.poi_distance_km or 0)
+        if not poi_city or poi_radius <= 0:
+            return details
+
+        api_key = self._config.google_maps_api_key or ""
+        poi_coords = city_coordinates.get(poi_city) or resolve_location_coordinates(poi_city, api_key=api_key)
+        if not poi_coords:
+            return details
+
+        for city in cities:
+            source = "local"
+            coords = city_coordinates.get(city)
+            if not coords:
+                coords = resolve_location_coordinates(city, api_key=api_key)
+                source = "resolved" if coords else "missing"
+
+            if not coords:
+                details.append(
+                    {
+                        "city": city,
+                        "distance_km": None,
+                        "within_poi": False,
+                        "coords_source": source,
+                    }
+                )
+                continue
+
+            distance = compute_distance_km(poi_coords[0], poi_coords[1], coords[0], coords[1])
+            details.append(
+                {
+                    "city": city,
+                    "distance_km": round(distance, 2),
+                    "within_poi": distance <= poi_radius,
+                    "coords_source": source,
+                }
+            )
+
+        return details
 
     def _parse_payload(self, payload: Dict[str, Any]) -> Optional[AlertSummary]:
         """Map the raw OREF payload to our AlertSummary model."""
@@ -241,7 +339,8 @@ class AlertFetcher(QObject):
         if not poi_city:
             return []
 
-        poi_coords = city_coordinates.get(poi_city)
+        api_key = self._config.google_maps_api_key or ""
+        poi_coords = city_coordinates.get(poi_city) or resolve_location_coordinates(poi_city, api_key=api_key)
         if not poi_coords:
             # Fallback: match by name only
             return [c for c in cities if c == poi_city]
@@ -253,7 +352,7 @@ class AlertFetcher(QObject):
 
         within = []
         for city in cities:
-            coords = city_coordinates.get(city)
+            coords = city_coordinates.get(city) or resolve_location_coordinates(city, api_key=api_key)
             if not coords:
                 # Try a close match to our known coordinate list
                 matches = get_close_matches(city, city_coordinates.keys(), n=1, cutoff=0.75)
@@ -305,14 +404,15 @@ class AlertFetcher(QObject):
         if not poi_city or poi_radius <= 0:
             return True
 
-        poi_coords = city_coordinates.get(poi_city)
+        api_key = self._config.google_maps_api_key or ""
+        poi_coords = city_coordinates.get(poi_city) or resolve_location_coordinates(poi_city, api_key=api_key)
         if not poi_coords:
             # Fallback: if the alert explicitly mentions the POI city, treat it as in range.
             return poi_city in cities
 
         poi_lat, poi_lon = poi_coords
         for city in cities:
-            coords = city_coordinates.get(city)
+            coords = city_coordinates.get(city) or resolve_location_coordinates(city, api_key=api_key)
             if not coords:
                 continue
             dist = compute_distance_km(poi_lat, poi_lon, coords[0], coords[1])

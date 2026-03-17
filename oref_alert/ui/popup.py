@@ -93,7 +93,8 @@ class PopupNotification(QWidget):
         self._expire_timer = QTimer(self)
         self._expire_timer.setSingleShot(True)
         self._expire_timer.timeout.connect(self._animate_out)
-        self._expire_timer.start(self.duration_ms)
+        if self.duration_ms > 0:
+            self._expire_timer.start(self.duration_ms)
 
     def _format_cities(self) -> str:
         if not self._cities:
@@ -132,9 +133,6 @@ class PopupNotification(QWidget):
         self.anim.setEndValue(1.0)
         self.anim.setEasingCurve(QEasingCurve.InOutCubic)
         self.anim.start()
-
-        if self.duration_ms > 0:
-            QTimer.singleShot(self.duration_ms, self._animate_out)
 
     def _animate_out(self) -> None:
         self.anim = QPropertyAnimation(self, b"windowOpacity")

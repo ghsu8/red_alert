@@ -131,7 +131,7 @@ def _build_map_html(*, api_key: str, payload: dict[str, object]) -> str:
       const poiEl = document.createElement('div');
       poiEl.style.width = '18px';
       poiEl.style.height = '18px';
-      poiEl.style.background = '#ff0000';
+      poiEl.style.background = '#38bdf8';
       poiEl.style.border = '2px solid #ffffff';
       poiEl.style.borderRadius = '50%';
       poiEl.style.boxShadow = '0 0 5px rgba(0,0,0,0.5)';
@@ -147,13 +147,17 @@ def _build_map_html(*, api_key: str, payload: dict[str, object]) -> str:
       const poiInfo = new google.maps.InfoWindow({{
         content: `<div dir="rtl"><strong>${{MAP_PAYLOAD.poiName}}</strong><br>נקודת ייחוס</div>`
       }});
-      poiMarker.addListener('click', () => poiInfo.open({{ anchor: poiMarker, map }}));
+      if (typeof poiMarker.addEventListener === 'function') {{
+        poiMarker.addEventListener('gmp-click', () => poiInfo.open({{ anchor: poiMarker, map }}));
+      }} else {{
+        poiMarker.addListener('click', () => poiInfo.open({{ anchor: poiMarker, map }}));
+      }}
 
       new google.maps.Circle({{
-        strokeColor: '#ff3b30',
+        strokeColor: '#38bdf8',
         strokeOpacity: 0.9,
         strokeWeight: 2,
-        fillColor: '#ff3b30',
+        fillColor: '#38bdf8',
         fillOpacity: 0.18,
         map,
         center,
@@ -169,7 +173,7 @@ def _build_map_html(*, api_key: str, payload: dict[str, object]) -> str:
         markerEl.style.width = '14px';
         markerEl.style.height = '14px';
         markerEl.style.borderRadius = '50%';
-        markerEl.style.background = point.kind === 'alert' ? '#0066ff' : '#ffcc00';
+        markerEl.style.background = point.kind === 'alert' ? '#ef4444' : '#9ca3af';
         markerEl.style.border = '2px solid #ffffff';
         markerEl.style.boxShadow = '0 0 3px rgba(0,0,0,0.4)';
 
@@ -183,7 +187,11 @@ def _build_map_html(*, api_key: str, payload: dict[str, object]) -> str:
         const info = new google.maps.InfoWindow({{
           content: `<div dir="rtl"><strong>${{point.name}}</strong><br>${{point.kind === 'alert' ? 'עיר בהתראה' : 'בתוך טווח POI'}}</div>`
         }});
-        marker.addListener('click', () => info.open({{ anchor: marker, map }}));
+        if (typeof marker.addEventListener === 'function') {{
+          marker.addEventListener('gmp-click', () => info.open({{ anchor: marker, map }}));
+        }} else {{
+          marker.addListener('click', () => info.open({{ anchor: marker, map }}));
+        }}
         bounds.extend(position);
       }}
 
@@ -210,8 +218,7 @@ def _build_static_israel_map_html(*, payload: dict[str, object]) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
   <style>
     html, body, #map {{
       height: 100%; width: 100%; margin: 0; padding: 0;
@@ -220,8 +227,7 @@ def _build_static_israel_map_html(*, payload: dict[str, object]) -> str:
 </head>
 <body>
   <div id="map"></div>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV/XN/WLEo=" crossorigin=""></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
   <script>
     const MAP_PAYLOAD = {payload_json};
     const center = MAP_PAYLOAD.center;
@@ -234,9 +240,9 @@ def _build_static_israel_map_html(*, payload: dict[str, object]) -> str:
       maxZoom: 19
     }}).addTo(map);
 
-    // POI red circle marker
+    // POI light-blue circle marker
     const poiIcon = L.divIcon({{
-      html: '<div style="width:18px;height:18px;background:#ff0000;border-radius:50%;border:2.5px solid #fff;box-shadow:0 0 5px rgba(0,0,0,0.5)"></div>',
+      html: '<div style="width:18px;height:18px;background:#38bdf8;border-radius:50%;border:2.5px solid #fff;box-shadow:0 0 5px rgba(0,0,0,0.5)"></div>',
       className: '',
       iconSize: [18, 18],
       iconAnchor: [9, 9]
@@ -248,16 +254,16 @@ def _build_static_israel_map_html(*, payload: dict[str, object]) -> str:
     // Radius circle
     L.circle([center.lat, center.lng], {{
       radius: MAP_PAYLOAD.radiusMeters,
-      color: '#ff3b30',
-      fillColor: '#ff3b30',
+      color: '#38bdf8',
+      fillColor: '#38bdf8',
       fillOpacity: 0.12,
       weight: 2
     }}).addTo(map);
 
     // Points
     for (const point of MAP_PAYLOAD.points) {{
-      const color = point.kind === 'alert' ? '#0066ff' : '#ffcc00';
-      const border = point.kind === 'alert' ? '#ffffff' : '#333333';
+      const color = point.kind === 'alert' ? '#ef4444' : '#9ca3af';
+      const border = '#ffffff';
       const icon = L.divIcon({{
         html: '<div style="width:14px;height:14px;background:' + color + ';border-radius:50%;border:2px solid ' + border + ';box-shadow:0 0 3px rgba(0,0,0,0.4)"></div>',
         className: '',
