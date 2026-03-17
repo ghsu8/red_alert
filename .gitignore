@@ -16,6 +16,8 @@ dist/
 # Installer outputs
 *.exe
 *.msi
+!installers/
+!installers/**/*.exe
 
 # Logs and temp
 *.log
