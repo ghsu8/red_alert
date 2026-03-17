@@ -3,7 +3,12 @@
 
 ; Define constants
 !define PRODUCT_NAME "Red Alert"
-!define PRODUCT_VERSION "1.0.0"
+!ifndef PRODUCT_VERSION
+  !define PRODUCT_VERSION "1.0.0"
+!endif
+!ifndef OUTPUT_DIR
+  !define OUTPUT_DIR "dist"
+!endif
 !define PRODUCT_PUBLISHER "Red Alert"
 !define PRODUCT_WEB_SITE "https://github.com"
 !define PRODUCT_DIR_REGKEY "Software\Microsoft\Windows\CurrentVersion\App Paths\RedAlert.exe"
@@ -23,7 +28,7 @@
 
 ; Installer attributes
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
-OutFile "dist\RedAlert_Setup_${PRODUCT_VERSION}.exe"
+OutFile "${OUTPUT_DIR}\RedAlert_Setup_${PRODUCT_VERSION}.exe"
 InstallDir "$PROGRAMFILES\${PRODUCT_NAME}"
 ShowInstDetails show
 ShowUnInstDetails show
